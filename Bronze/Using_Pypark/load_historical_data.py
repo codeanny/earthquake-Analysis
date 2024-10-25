@@ -4,15 +4,33 @@
 # and uploads the data to a specified Google Cloud Storage bucket using utility functions.
 # Update Date: 21-10-2024
 #################################################
+
 import json
-import os
+from google.cloud import bigquery
 import logging
 from decimal import Decimal
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_unixtime, col, split, current_timestamp
 from pyspark.sql.types import StructType, StructField, DecimalType, LongType, StringType, IntegerType
-import utils  # Ensure this module contains the required functions
-from config import config
+import utils
+import os
+
+# Google Cloud Project Configuration
+GCP_PROJECT_ID = 'bwt-lear'
+REGION = 'us-central1'
+SERVICE_ACCOUNT = r"C:\Users\Aniket Ahire\Downloads\bwt-lear-68d6af1da6d5.json"
+
+# Google Cloud Storage Configuration
+GCS_BUCKET_NAME = "earthquake_data_anny"
+BRONZE_PATH = "landing_layer/20241021/data.json"
+SILVER_PATH = "Silver/20241021/flattened_data"
+TEMP_LOCATION = 'gs://earthquake_data_anny/temp'  # Temporary location for Dataflow jobs
+
+# BigQuery Configuration
+BIGQUERY_TABLE = "earthquake_db.earthquake_data"
+
+# Earthquake Data API URL
+EARTHQUAKE_DATA_URL = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_month.geojson'
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +40,10 @@ if __name__ == "__main__":
     spark = SparkSession.builder.master('local[*]').appName('historical_data').getOrCreate()
 
     # Set the environment variable for Google Cloud credentials
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = config.SERVICE_ACCOUNT
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = SERVICE_ACCOUNT
 
     # URL for fetching earthquake data
-    url = config.EARTHQUAKE_DATA_URL
+    url = EARTHQUAKE_DATA_URL
 
     # Fetch data from API
     try:
@@ -36,19 +54,19 @@ if __name__ == "__main__":
         exit(1)
 
     # GCS bucket information
-    bucket_name = config.GCS_BUCKET_NAME
+    bucket_name = GCS_BUCKET_NAME
 
-    # Upload the data to GCS(BRONZE_LAYER)
+    # Upload the data to GCS (BRONZE_LAYER)
     try:
-        utils.upload_to_gcs(bucket_name, config.BRONZE_PATH, response)
-        logging.info(f"File uploaded to {config.BRONZE_PATH} in bucket {bucket_name}.")
+        utils.upload_to_gcs(bucket_name, BRONZE_PATH, response)
+        logging.info(f"File uploaded to {BRONZE_PATH} in bucket {bucket_name}.")
     except Exception as e:
         logging.error(f"Error uploading to GCS: {e}")
         exit(1)
 
     # Reading back the data from GCS for further processing
     try:
-        downloaded_data = utils.read_data_from_gcs(bucket_name, source_blob_name=config.BRONZE_PATH)
+        downloaded_data = utils.read_data_from_gcs(bucket_name, source_blob_name=BRONZE_PATH)
         logging.info("Downloaded data from GCS.")
     except Exception as e:
         logging.error(f"Error reading from GCS: {e}")
@@ -139,10 +157,8 @@ if __name__ == "__main__":
 
     # Creating DataFrame from the structured data
     df = spark.createDataFrame(formatted_properties, schema=input_schema)
-    # df.show(10)
 
     # Write DataFrame to GCS in json format
-    # destination_blob_name_silver = 'silver/20241021/data.json'
     json_data = df.toJSON().collect()  # Collects the DataFrame as a list of JSON strings
     data_to_upload = [json.loads(record) for record in json_data]  # Convert each string to a dictionary
 
@@ -152,18 +168,31 @@ if __name__ == "__main__":
 
     # Transformation2: Extract area from the "place" column based on the word "of"
     df = df.withColumn("area", split(col("place"), " of ").getItem(1))
+    df.show()
 
-    # Upload the data to GCS(BRONZE_LAYER)
+    # Upload the data to GCS (SILVER_LAYER)
     try:
-        utils.upload_to_gcs(bucket_name, config.SILVER_PATH, data_to_upload)
-        logging.info(f"File uploaded to {config.SILVER_PATH} in bucket {bucket_name}.")
+        utils.upload_to_gcs(bucket_name, SILVER_PATH, data_to_upload)
+        logging.info(f"File uploaded to {SILVER_PATH} in bucket {bucket_name}.")
     except Exception as e:
         logging.error(f"Error uploading to GCS: {e}")
         exit(1)
 
+
     # Upload to BigQuery:
-    # Transformation1:
 
-    df = df.withColumn("insert_dt", current_timestamp())
+    # Add a timestamp column for insertion date
+    df1 = df.withColumn('insert_date', current_timestamp())
+    df1.show()
 
-    df.show()
+    # Write the final data to BigQuery
+    try :
+        df1.write.format("bigquery") \
+        .option("table", "bwt-lear.earthquake_dataset.earthquake_data") \
+        .option("writeMethod", "direct") \
+        .option("temporaryGcsBucket","earthquake_data_anny") \
+        .save()
+
+        print("data successfully loaded to bigquery")
+    except Exception as e:
+        print(f"failed to load data to bigquery")
